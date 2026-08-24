@@ -1,0 +1,51 @@
+name: Validate patch
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out upstream Linkding
+        run: |
+          git clone --depth 1 --branch "$(tr -d '[:space:]' < UPSTREAM_VERSION)" \
+            https://github.com/sissbruecker/linkding.git source
+      - name: Apply patch
+        run: |
+          git -C source apply --check ../patches/usage-tracking.patch
+          git -C source apply ../patches/usage-tracking.patch
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        working-directory: source
+        run: uv sync --frozen
+      - name: Check migrations
+        working-directory: source
+        run: |
+          mkdir -p data
+          uv run manage.py makemigrations --check --dry-run
+          uv run manage.py migrate --plan
+          uv run manage.py migrate
+      - name: Lint
+        working-directory: source
+        run: |
+          uv run ruff check bookmarks
+          uv run djlint bookmarks/templates --check --quiet
+      - name: Run focused tests
+        working-directory: source
+        run: |
+          uv run pytest \
+            bookmarks/tests/test_bookmark_visit_view.py \
+            bookmarks/tests/test_bookmark_details_modal.py \
+            bookmarks/tests/test_bookmark_search_form.py \
+            bookmarks/tests/test_bookmarks_list_template.py \
+            bookmarks/tests/test_queries.py \
+            bookmarks/tests/test_settings_general_view.py
+      - name: Build application image
+        working-directory: source
+        run: docker build --target linkding -f docker/default.Dockerfile .

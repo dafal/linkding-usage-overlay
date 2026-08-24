@@ -1,0 +1,675 @@
+diff --git a/bookmarks/forms.py b/bookmarks/forms.py
+index d599fb9..0717b4b 100644
+--- a/bookmarks/forms.py
++++ b/bookmarks/forms.py
+@@ -290,6 +290,17 @@ class BookmarkSearchForm(forms.Form):
+             user_choices.insert(0, ("", "Everyone"))
+             self.fields["user"].choices = user_choices
+ 
++        request = search.request
++        if (
++            request
++            and request.user.is_authenticated
++            and request.user.profile.enable_usage_tracking
++        ):
++            self.fields["sort"].choices = [
++                (BookmarkSearch.SORT_USAGE_DESC, "Most Used"),
++                *self.SORT_CHOICES,
++            ]
++
+         for param in search.params:
+             # set initial values for modified params
+             value = search.__dict__.get(param)
+@@ -337,6 +348,7 @@ class UserProfileForm(forms.ModelForm):
+             "collapse_side_panel",
+             "hide_bundles",
+             "legacy_search",
++            "enable_usage_tracking",
+         ]
+         widgets = {
+             "theme": FormSelect,
+@@ -360,6 +372,7 @@ class UserProfileForm(forms.ModelForm):
+             "collapse_side_panel": FormCheckbox,
+             "hide_bundles": FormCheckbox,
+             "legacy_search": FormCheckbox,
++            "enable_usage_tracking": FormCheckbox,
+             "enable_favicons": FormCheckbox,
+             "enable_preview_images": FormCheckbox,
+             "enable_sharing": FormCheckbox,
+diff --git a/bookmarks/migrations/10000_merge_0054_usage_tracking.py b/bookmarks/migrations/10000_merge_0054_usage_tracking.py
+new file mode 100644
+index 0000000..75a7f8f
+--- /dev/null
++++ b/bookmarks/migrations/10000_merge_0054_usage_tracking.py
+@@ -0,0 +1,10 @@
++from django.db import migrations
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("bookmarks", "0054_bookmarkbundle_filter_shared_and_more"),
++        ("bookmarks", "9999_usage_tracking_fork"),
++    ]
++
++    operations = []
+diff --git a/bookmarks/migrations/9999_usage_tracking_fork.py b/bookmarks/migrations/9999_usage_tracking_fork.py
+new file mode 100644
+index 0000000..dfa4c5d
+--- /dev/null
++++ b/bookmarks/migrations/9999_usage_tracking_fork.py
+@@ -0,0 +1,61 @@
++# Fork migration identity retained for databases that have already recorded it.
++
++import django.db.models.deletion
++from django.conf import settings
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
++        ("bookmarks", "0051_fix_normalized_url"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="userprofile",
++            name="enable_usage_tracking",
++            field=models.BooleanField(default=False),
++        ),
++        migrations.CreateModel(
++            name="BookmarkUsage",
++            fields=[
++                (
++                    "id",
++                    models.BigAutoField(
++                        auto_created=True,
++                        primary_key=True,
++                        serialize=False,
++                        verbose_name="ID",
++                    ),
++                ),
++                ("access_count", models.IntegerField(default=0)),
++                ("last_accessed", models.DateTimeField(auto_now=True)),
++                (
++                    "bookmark",
++                    models.ForeignKey(
++                        on_delete=django.db.models.deletion.CASCADE,
++                        to="bookmarks.bookmark",
++                    ),
++                ),
++                (
++                    "user",
++                    models.ForeignKey(
++                        on_delete=django.db.models.deletion.CASCADE,
++                        to=settings.AUTH_USER_MODEL,
++                    ),
++                ),
++            ],
++        ),
++        migrations.AddIndex(
++            model_name="bookmarkusage",
++            index=models.Index(
++                fields=["user", "-access_count"],
++                name="bookmarks_b_user_id_8c5f6d_idx",
++            ),
++        ),
++        migrations.AlterUniqueTogether(
++            name="bookmarkusage",
++            unique_together={("bookmark", "user")},
++        ),
++    ]
+diff --git a/bookmarks/models.py b/bookmarks/models.py
+index bd45335..ca921d8 100644
+--- a/bookmarks/models.py
++++ b/bookmarks/models.py
+@@ -221,6 +221,22 @@ class BookmarkBundle(models.Model):
+         return self.name
+ 
+ 
++class BookmarkUsage(models.Model):
++    bookmark = models.ForeignKey(Bookmark, on_delete=models.CASCADE)
++    user = models.ForeignKey(User, on_delete=models.CASCADE)
++    access_count = models.IntegerField(default=0, null=False)
++    last_accessed = models.DateTimeField(auto_now=True, null=False)
++
++    class Meta:
++        unique_together = [["bookmark", "user"]]
++        indexes = [
++            models.Index(
++                fields=["user", "-access_count"],
++                name="bookmarks_b_user_id_8c5f6d_idx",
++            )
++        ]
++
++
+ class BookmarkSearch:
+     SORT_ADDED_ASC = "added_asc"
+     SORT_ADDED_DESC = "added_desc"
+@@ -228,6 +244,7 @@ class BookmarkSearch:
+     SORT_MODIFIED_DESC = "modified_desc"
+     SORT_TITLE_ASC = "title_asc"
+     SORT_TITLE_DESC = "title_desc"
++    SORT_USAGE_DESC = "usage_desc"
+ 
+     FILTER_SHARED_OFF = "off"
+     FILTER_SHARED_SHARED = "yes"
+@@ -460,6 +477,7 @@ class UserProfile(models.Model):
+     collapse_side_panel = models.BooleanField(default=False, null=False)
+     hide_bundles = models.BooleanField(default=False, null=False)
+     legacy_search = models.BooleanField(default=False, null=False)
++    enable_usage_tracking = models.BooleanField(default=False, null=False)
+ 
+     def save(self, *args, **kwargs):
+         if self.custom_css:
+diff --git a/bookmarks/queries.py b/bookmarks/queries.py
+index da45271..3ab7f88 100644
+--- a/bookmarks/queries.py
++++ b/bookmarks/queries.py
+@@ -3,14 +3,26 @@ import contextlib
+ from django.conf import settings
+ from django.contrib.auth.models import User
+ from django.core.exceptions import ValidationError
+-from django.db.models import Case, CharField, Exists, OuterRef, Q, QuerySet, When
++from django.db.models import (
++    Case,
++    CharField,
++    Exists,
++    IntegerField,
++    OuterRef,
++    Q,
++    QuerySet,
++    Subquery,
++    Value,
++    When,
++)
+ from django.db.models.expressions import RawSQL
+-from django.db.models.functions import Lower
++from django.db.models.functions import Coalesce, Lower
+ 
+ from bookmarks.models import (
+     Bookmark,
+     BookmarkBundle,
+     BookmarkSearch,
++    BookmarkUsage,
+     Tag,
+     UserProfile,
+     parse_tag_string,
+@@ -302,6 +314,21 @@ def _base_bookmarks_query(
+         query_set = query_set.order_by("date_modified")
+     elif search.sort == BookmarkSearch.SORT_MODIFIED_DESC:
+         query_set = query_set.order_by("-date_modified")
++    elif (
++        search.sort == BookmarkSearch.SORT_USAGE_DESC
++        and search.request
++        and search.request.user.is_authenticated
++        and search.request.user.profile.enable_usage_tracking
++    ):
++        usage_count = BookmarkUsage.objects.filter(
++            bookmark=OuterRef("pk"), user=search.request.user
++        ).values("access_count")[:1]
++        query_set = query_set.annotate(
++            user_access_count=Coalesce(
++                Subquery(usage_count, output_field=IntegerField()),
++                Value(0),
++            )
++        ).order_by("-user_access_count", "-date_added")
+     else:
+         # Sort by date added, descending by default
+         query_set = query_set.order_by("-date_added")
+diff --git a/bookmarks/templates/bookmarks/bookmark_list.html b/bookmarks/templates/bookmarks/bookmark_list.html
+index 86d42f9..f8f92d9 100644
+--- a/bookmarks/templates/bookmarks/bookmark_list.html
++++ b/bookmarks/templates/bookmarks/bookmark_list.html
+@@ -23,17 +23,19 @@
+               {% if bookmark_item.favicon_file and bookmark_list.show_favicons %}
+                 <img class="favicon" src="{% static bookmark_item.favicon_file %}" alt="">
+               {% endif %}
+-              <a href="{{ bookmark_item.url }}"
++              <a href="{% if request.user.is_authenticated and request.user.profile.enable_usage_tracking %}{% url 'linkding:bookmarks.visit' bookmark_item.id %}{% else %}{{ bookmark_item.url }}{% endif %}"
+                  target="{{ bookmark_list.link_target }}"
+-                 rel="noopener">
++                 rel="noopener"
++                 {% if request.user.is_authenticated and request.user.profile.enable_usage_tracking %}data-turbo-prefetch="false"{% endif %}>
+                 <span>{{ bookmark_item.title }}</span>
+               </a>
+             </div>
+             {% if bookmark_list.show_url %}
+               <div class="url-path truncate">
+-                <a href="{{ bookmark_item.url }}"
++                <a href="{% if request.user.is_authenticated and request.user.profile.enable_usage_tracking %}{% url 'linkding:bookmarks.visit' bookmark_item.id %}{% else %}{{ bookmark_item.url }}{% endif %}"
+                    target="{{ bookmark_list.link_target }}"
+                    rel="noopener"
++                   {% if request.user.is_authenticated and request.user.profile.enable_usage_tracking %}data-turbo-prefetch="false"{% endif %}
+                    class="url-display">{{ bookmark_item.url }}</a>
+               </div>
+             {% endif %}
+diff --git a/bookmarks/templates/bookmarks/details/form.html b/bookmarks/templates/bookmarks/details/form.html
+index dd3eb19..e4307a6 100644
+--- a/bookmarks/templates/bookmarks/details/form.html
++++ b/bookmarks/templates/bookmarks/details/form.html
+@@ -8,8 +8,9 @@
+     <input type="hidden" name="update_state" value="{{ details.bookmark.id }}">
+     <div class="weblinks">
+       <a class="weblink"
+-         href="{{ details.bookmark.url }}"
++         href="{% if request.user.is_authenticated and details.profile.enable_usage_tracking %}{% url 'linkding:bookmarks.visit' details.bookmark.id %}{% else %}{{ details.bookmark.url }}{% endif %}"
+          rel="noopener"
++         {% if request.user.is_authenticated and details.profile.enable_usage_tracking %}data-turbo-prefetch="false"{% endif %}
+          target="{{ details.profile.bookmark_link_target }}">
+         {% if details.show_link_icons %}
+           <img class="favicon"
+diff --git a/bookmarks/templates/settings/general.html b/bookmarks/templates/settings/general.html
+index 36a2ef5..9e35a97 100644
+--- a/bookmarks/templates/settings/general.html
++++ b/bookmarks/templates/settings/general.html
+@@ -221,6 +221,13 @@ reddit.com/r/Music music reddit</pre>
+             This can be overridden when creating each new bookmark.
+           {% endformhelp %}
+         </div>
++        <div class="form-group">
++          {% formfield form.enable_usage_tracking label="Enable usage tracking" has_help=True %}
++          {% formhelp form.enable_usage_tracking %}
++            Tracks how often you access bookmarks and enables sorting by "Most Used".
++            Usage data is private to your account and stored locally.
++          {% endformhelp %}
++        </div>
+         <div class="form-group">
+           <details {% if form.custom_css.value %}open{% endif %}>
+             <summary>
+diff --git a/bookmarks/tests/test_bookmark_details_modal.py b/bookmarks/tests/test_bookmark_details_modal.py
+index b287317..b061209 100644
+--- a/bookmarks/tests/test_bookmark_details_modal.py
++++ b/bookmarks/tests/test_bookmark_details_modal.py
+@@ -310,6 +310,19 @@ class BookmarkDetailsModalTestCase(TestCase, BookmarkFactoryMixin, HtmlTestMixin
+             web_archive_link["target"], UserProfile.BOOKMARK_LINK_TARGET_SELF
+         )
+ 
++    def test_website_link_tracks_usage_and_disables_prefetch_when_enabled(self):
++        profile = self.get_or_create_test_user().profile
++        profile.enable_usage_tracking = True
++        profile.save()
++        bookmark = self.setup_bookmark()
++
++        soup = self.get_index_details_modal(bookmark)
++        visit_url = reverse("linkding:bookmarks.visit", args=[bookmark.id])
++        website_link = self.find_weblink(soup, visit_url)
++
++        self.assertIsNotNone(website_link)
++        self.assertEqual(website_link["data-turbo-prefetch"], "false")
++
+     def test_preview_image(self):
+         # without image
+         bookmark = self.setup_bookmark()
+diff --git a/bookmarks/tests/test_bookmark_search_form.py b/bookmarks/tests/test_bookmark_search_form.py
+index 34bdd95..49d08ab 100644
+--- a/bookmarks/tests/test_bookmark_search_form.py
++++ b/bookmarks/tests/test_bookmark_search_form.py
+@@ -1,4 +1,5 @@
+-from django.test import TestCase
++from django.contrib.auth.models import AnonymousUser
++from django.test import RequestFactory, TestCase
+ 
+ from bookmarks.forms import BookmarkSearchForm
+ from bookmarks.models import BookmarkSearch
+@@ -54,6 +55,31 @@ class BookmarkSearchFormTest(TestCase, BookmarkFactoryMixin):
+             ],
+         )
+ 
++    def test_most_used_option_only_for_authenticated_user_with_tracking_enabled(self):
++        request = RequestFactory().get("/bookmarks")
++        request.user = AnonymousUser()
++        form = BookmarkSearchForm(BookmarkSearch(request=request))
++        self.assertNotIn(
++            BookmarkSearch.SORT_USAGE_DESC,
++            dict(form.fields["sort"].choices),
++        )
++
++        user = self.get_or_create_test_user()
++        request.user = user
++        form = BookmarkSearchForm(BookmarkSearch(request=request))
++        self.assertNotIn(
++            BookmarkSearch.SORT_USAGE_DESC,
++            dict(form.fields["sort"].choices),
++        )
++
++        user.profile.enable_usage_tracking = True
++        user.profile.save()
++        form = BookmarkSearchForm(BookmarkSearch(request=request))
++        self.assertEqual(
++            form.fields["sort"].choices[0],
++            (BookmarkSearch.SORT_USAGE_DESC, "Most Used"),
++        )
++
+     def test_hidden_fields(self):
+         # no modified params
+         search = BookmarkSearch()
+diff --git a/bookmarks/tests/test_bookmark_visit_view.py b/bookmarks/tests/test_bookmark_visit_view.py
+new file mode 100644
+index 0000000..2b83d1c
+--- /dev/null
++++ b/bookmarks/tests/test_bookmark_visit_view.py
+@@ -0,0 +1,100 @@
++import datetime
++
++from django.test import TestCase
++from django.urls import reverse
++from django.utils import timezone
++
++from bookmarks.models import BookmarkUsage
++from bookmarks.tests.helpers import BookmarkFactoryMixin
++
++
++class BookmarkVisitViewTestCase(TestCase, BookmarkFactoryMixin):
++    def setUp(self):
++        self.user = self.get_or_create_test_user()
++        self.bookmark = self.setup_bookmark(url="https://example.com/target")
++        self.visit_url = reverse("linkding:bookmarks.visit", args=[self.bookmark.id])
++
++    def test_requires_login(self):
++        response = self.client.get(self.visit_url)
++
++        self.assertRedirects(response, reverse("login") + f"?next={self.visit_url}")
++        self.assertFalse(BookmarkUsage.objects.exists())
++
++    def test_private_bookmark_cannot_be_guessed(self):
++        other_user = self.setup_user(name="other")
++        other_user.profile.enable_usage_tracking = True
++        other_user.profile.save()
++        self.client.force_login(other_user)
++
++        response = self.client.get(self.visit_url)
++
++        self.assertEqual(response.status_code, 404)
++        self.assertFalse(BookmarkUsage.objects.exists())
++
++    def test_does_not_track_when_disabled(self):
++        self.client.force_login(self.user)
++
++        response = self.client.get(self.visit_url)
++
++        self.assertRedirects(
++            response, self.bookmark.url, fetch_redirect_response=False
++        )
++        self.assertFalse(BookmarkUsage.objects.exists())
++
++    def test_rejects_non_get_requests(self):
++        self.user.profile.enable_usage_tracking = True
++        self.user.profile.save()
++        self.client.force_login(self.user)
++
++        response = self.client.post(self.visit_url)
++
++        self.assertEqual(response.status_code, 405)
++        self.assertFalse(BookmarkUsage.objects.exists())
++
++    def test_atomically_increments_count_and_updates_last_accessed(self):
++        self.user.profile.enable_usage_tracking = True
++        self.user.profile.save()
++        self.client.force_login(self.user)
++
++        self.client.get(self.visit_url)
++        usage = BookmarkUsage.objects.get(bookmark=self.bookmark, user=self.user)
++        old_accessed = timezone.now() - datetime.timedelta(days=1)
++        BookmarkUsage.objects.filter(pk=usage.pk).update(last_accessed=old_accessed)
++
++        response = self.client.get(self.visit_url)
++
++        usage.refresh_from_db()
++        self.assertRedirects(
++            response, self.bookmark.url, fetch_redirect_response=False
++        )
++        self.assertEqual(usage.access_count, 2)
++        self.assertGreater(usage.last_accessed, old_accessed)
++
++    def test_tracks_shared_bookmark_separately_for_each_viewer(self):
++        self.user.profile.enable_sharing = True
++        self.user.profile.enable_usage_tracking = True
++        self.user.profile.save()
++        self.bookmark.shared = True
++        self.bookmark.save()
++        other_user = self.setup_user(name="other")
++        other_user.profile.enable_usage_tracking = True
++        other_user.profile.save()
++
++        self.client.force_login(self.user)
++        self.client.get(self.visit_url)
++        self.client.force_login(other_user)
++        self.client.get(self.visit_url)
++        self.client.get(self.visit_url)
++
++        self.assertEqual(
++            BookmarkUsage.objects.get(
++                bookmark=self.bookmark, user=self.user
++            ).access_count,
++            1,
++        )
++        self.assertEqual(
++            BookmarkUsage.objects.get(
++                bookmark=self.bookmark, user=other_user
++            ).access_count,
++            2,
++        )
+diff --git a/bookmarks/tests/test_bookmarks_list_template.py b/bookmarks/tests/test_bookmarks_list_template.py
+index 87acea9..da674a6 100644
+--- a/bookmarks/tests/test_bookmarks_list_template.py
++++ b/bookmarks/tests/test_bookmarks_list_template.py
+@@ -551,6 +551,40 @@ class BookmarkListTemplateTest(TestCase, BookmarkFactoryMixin, HtmlTestMixin):
+ 
+         self.assertBookmarksLink(html, bookmark, link_target="_self")
+ 
++    def test_bookmark_links_track_usage_and_disable_turbo_prefetch_when_enabled(self):
++        profile = self.get_or_create_test_user().profile
++        profile.enable_usage_tracking = True
++        profile.display_url = True
++        profile.save()
++        bookmark = self.setup_bookmark()
++
++        html = self.render_template()
++        soup = self.make_soup(html)
++        visit_url = reverse("linkding:bookmarks.visit", args=[bookmark.id])
++        title_link = soup.select_one(".title > a")
++        url_link = soup.select_one(".url-display")
++
++        self.assertEqual(title_link["href"], visit_url)
++        self.assertEqual(url_link["href"], visit_url)
++        self.assertEqual(title_link["data-turbo-prefetch"], "false")
++        self.assertEqual(url_link["data-turbo-prefetch"], "false")
++
++    def test_bookmark_links_remain_direct_when_usage_tracking_is_disabled(self):
++        profile = self.get_or_create_test_user().profile
++        profile.display_url = True
++        profile.save()
++        bookmark = self.setup_bookmark()
++
++        html = self.render_template()
++        soup = self.make_soup(html)
++        title_link = soup.select_one(".title > a")
++        url_link = soup.select_one(".url-display")
++
++        self.assertEqual(title_link["href"], bookmark.url)
++        self.assertEqual(url_link["href"], bookmark.url)
++        self.assertNotIn("data-turbo-prefetch", title_link.attrs)
++        self.assertNotIn("data-turbo-prefetch", url_link.attrs)
++
+     def test_web_archive_link_target_should_be_blank_by_default(self):
+         bookmark = self.setup_bookmark()
+         bookmark.date_added = timezone.now() - datetime.timedelta(days=8)
+diff --git a/bookmarks/tests/test_queries.py b/bookmarks/tests/test_queries.py
+index de706d1..f7afa6a 100644
+--- a/bookmarks/tests/test_queries.py
++++ b/bookmarks/tests/test_queries.py
+@@ -2,11 +2,11 @@ import datetime
+ import operator
+ 
+ from django.db.models import QuerySet
+-from django.test import TestCase
++from django.test import RequestFactory, TestCase
+ from django.utils import timezone
+ 
+ from bookmarks import queries
+-from bookmarks.models import BookmarkBundle, BookmarkSearch, UserProfile
++from bookmarks.models import BookmarkBundle, BookmarkSearch, BookmarkUsage, UserProfile
+ from bookmarks.tests.helpers import BookmarkFactoryMixin, random_sentence
+ from bookmarks.utils import unique
+ 
+@@ -1228,6 +1228,46 @@ class QueriesBasicTestCase(TestCase, BookmarkFactoryMixin):
+         query = queries.query_bookmarks(self.user, self.profile, search)
+         self.assertEqual(list(query), sorted_bookmarks)
+ 
++    def test_sort_by_usage_is_viewer_specific_with_zero_and_date_fallback(self):
++        self.profile.enable_usage_tracking = True
++        self.profile.save()
++        request = RequestFactory().get("/bookmarks")
++        request.user = self.user
++        search = BookmarkSearch(sort=BookmarkSearch.SORT_USAGE_DESC, request=request)
++        oldest = self.setup_bookmark(
++            added=timezone.datetime(2020, 1, 1, tzinfo=datetime.UTC)
++        )
++        newest = self.setup_bookmark(
++            added=timezone.datetime(2023, 1, 1, tzinfo=datetime.UTC)
++        )
++        unused = self.setup_bookmark(
++            added=timezone.datetime(2024, 1, 1, tzinfo=datetime.UTC)
++        )
++        BookmarkUsage.objects.create(bookmark=oldest, user=self.user, access_count=5)
++        BookmarkUsage.objects.create(bookmark=newest, user=self.user, access_count=5)
++        other_user = self.setup_user(name="other")
++        BookmarkUsage.objects.create(bookmark=unused, user=other_user, access_count=99)
++
++        query = queries.query_bookmarks(self.user, self.profile, search)
++
++        self.assertEqual(list(query), [newest, oldest, unused])
++
++    def test_sort_by_usage_falls_back_to_added_when_tracking_is_disabled(self):
++        request = RequestFactory().get("/bookmarks")
++        request.user = self.user
++        search = BookmarkSearch(sort=BookmarkSearch.SORT_USAGE_DESC, request=request)
++        older = self.setup_bookmark(
++            added=timezone.datetime(2020, 1, 1, tzinfo=datetime.UTC)
++        )
++        newer = self.setup_bookmark(
++            added=timezone.datetime(2023, 1, 1, tzinfo=datetime.UTC)
++        )
++        BookmarkUsage.objects.create(bookmark=older, user=self.user, access_count=10)
++
++        query = queries.query_bookmarks(self.user, self.profile, search)
++
++        self.assertEqual(list(query), [newer, older])
++
+     def setup_title_sort_data(self):
+         # lots of combinations to test effective title logic
+         bookmarks = [
+diff --git a/bookmarks/tests/test_settings_general_view.py b/bookmarks/tests/test_settings_general_view.py
+index e1016f8..460b573 100644
+--- a/bookmarks/tests/test_settings_general_view.py
++++ b/bookmarks/tests/test_settings_general_view.py
+@@ -49,6 +49,7 @@ class SettingsGeneralViewTestCase(TestCase, BookmarkFactoryMixin):
+             "collapse_side_panel": False,
+             "hide_bundles": False,
+             "legacy_search": False,
++            "enable_usage_tracking": False,
+         }
+ 
+         return {**form_data, **overrides}
+@@ -123,6 +124,7 @@ class SettingsGeneralViewTestCase(TestCase, BookmarkFactoryMixin):
+             "collapse_side_panel": True,
+             "hide_bundles": True,
+             "legacy_search": True,
++            "enable_usage_tracking": True,
+         }
+         response = self.client.post(
+             reverse("linkding:settings.update"), form_data, follow=True
+@@ -208,9 +210,20 @@ class SettingsGeneralViewTestCase(TestCase, BookmarkFactoryMixin):
+         )
+         self.assertEqual(self.user.profile.hide_bundles, form_data["hide_bundles"])
+         self.assertEqual(self.user.profile.legacy_search, form_data["legacy_search"])
++        self.assertEqual(
++            self.user.profile.enable_usage_tracking,
++            form_data["enable_usage_tracking"],
++        )
+ 
+         self.assertSuccessMessage(html, "Profile updated")
+ 
++    def test_usage_tracking_is_disabled_by_default_and_visible_in_settings(self):
++        self.assertFalse(self.user.profile.enable_usage_tracking)
++
++        response = self.client.get(reverse("linkding:settings.general"))
++
++        self.assertContains(response, 'name="enable_usage_tracking"', count=1)
++
+     def test_update_profile_with_invalid_form_returns_422(self):
+         form_data = self.create_profile_form_data({"items_per_page": "-1"})
+         response = self.client.post(reverse("linkding:settings.update"), form_data)
+diff --git a/bookmarks/urls.py b/bookmarks/urls.py
+index 214917a..71e9257 100644
+--- a/bookmarks/urls.py
++++ b/bookmarks/urls.py
+@@ -43,6 +43,11 @@ urlpatterns = [
+     path(
+         "bookmarks/<int:bookmark_id>/edit", bookmarks_views.edit, name="bookmarks.edit"
+     ),
++    path(
++        "bookmarks/<int:bookmark_id>/visit",
++        bookmarks_views.visit,
++        name="bookmarks.visit",
++    ),
+     # Assets
+     path(
+         "assets/<int:asset_id>",
+diff --git a/bookmarks/views/bookmarks.py b/bookmarks/views/bookmarks.py
+index 4be1660..3dadf6a 100644
+--- a/bookmarks/views/bookmarks.py
++++ b/bookmarks/views/bookmarks.py
+@@ -2,7 +2,7 @@ import urllib.parse
+ 
+ from django.conf import settings
+ from django.contrib.auth.decorators import login_required
+-from django.db.models import QuerySet
++from django.db.models import F, QuerySet
+ from django.http import (
+     HttpResponseBadRequest,
+     HttpResponseForbidden,
+@@ -10,12 +10,16 @@ from django.http import (
+ )
+ from django.shortcuts import render
+ from django.urls import reverse
++from django.utils import timezone
++from django.views.decorators.cache import never_cache
++from django.views.decorators.http import require_GET
+ 
+ from bookmarks import queries, utils
+ from bookmarks.forms import BookmarkForm
+ from bookmarks.models import (
+     Bookmark,
+     BookmarkSearch,
++    BookmarkUsage,
+ )
+ from bookmarks.services import assets as asset_actions
+ from bookmarks.services import tasks
+@@ -422,6 +426,25 @@ def handle_action(request: HttpRequest, query: QuerySet[Bookmark] = None):
+             return create_html_snapshots(bookmark_ids, request.user)
+ 
+ 
++@login_required
++@require_GET
++@never_cache
++def visit(request: HttpRequest, bookmark_id: int):
++    bookmark = access.bookmark_read(request, bookmark_id)
++
++    if request.user.profile.enable_usage_tracking:
++        usage, _ = BookmarkUsage.objects.get_or_create(
++            bookmark=bookmark,
++            user=request.user,
++        )
++        BookmarkUsage.objects.filter(pk=usage.pk).update(
++            access_count=F("access_count") + 1,
++            last_accessed=timezone.now(),
++        )
++
++    return HttpResponseRedirect(bookmark.url)
++
++
+ @login_required
+ def close(request: HttpRequest):
+     return render(request, "bookmarks/close.html")
