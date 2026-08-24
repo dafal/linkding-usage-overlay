@@ -346,10 +346,10 @@ index 34bdd95..49d08ab 100644
          search = BookmarkSearch()
 diff --git a/bookmarks/tests/test_bookmark_visit_view.py b/bookmarks/tests/test_bookmark_visit_view.py
 new file mode 100644
-index 0000000..2b83d1c
+index 0000000..18e16bb
 --- /dev/null
 +++ b/bookmarks/tests/test_bookmark_visit_view.py
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,104 @@
 +import datetime
 +
 +from django.test import TestCase
@@ -369,7 +369,11 @@ index 0000000..2b83d1c
 +    def test_requires_login(self):
 +        response = self.client.get(self.visit_url)
 +
-+        self.assertRedirects(response, reverse("login") + f"?next={self.visit_url}")
++        self.assertRedirects(
++            response,
++            reverse("login") + f"?next={self.visit_url}",
++            fetch_redirect_response=False,
++        )
 +        self.assertFalse(BookmarkUsage.objects.exists())
 +
 +    def test_private_bookmark_cannot_be_guessed(self):
