@@ -54,7 +54,7 @@ index 0000000..75a7f8f
 +    operations = []
 diff --git a/bookmarks/migrations/9999_usage_tracking_fork.py b/bookmarks/migrations/9999_usage_tracking_fork.py
 new file mode 100644
-index 0000000..dfa4c5d
+index 0000000..bea1e02
 --- /dev/null
 +++ b/bookmarks/migrations/9999_usage_tracking_fork.py
 @@ -0,0 +1,61 @@
@@ -82,7 +82,7 @@ index 0000000..dfa4c5d
 +            fields=[
 +                (
 +                    "id",
-+                    models.BigAutoField(
++                    models.AutoField(
 +                        auto_created=True,
 +                        primary_key=True,
 +                        serialize=False,

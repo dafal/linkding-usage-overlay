@@ -27,7 +27,7 @@ jobs:
       - name: Check migrations
         working-directory: source
         run: |
-          mkdir -p data
+          mkdir -p data/assets data/favicons data/previews
           uv run manage.py makemigrations --check --dry-run
           uv run manage.py migrate --plan
           uv run manage.py migrate
