@@ -1,0 +1,38 @@
+name: Build test image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read upstream version
+        id: version
+        run: echo "upstream=$(tr -d '[:space:]' < UPSTREAM_VERSION)" >> "$GITHUB_OUTPUT"
+      - name: Check out upstream Linkding
+        run: |
+          git clone --depth 1 --branch "${{ steps.version.outputs.upstream }}" \
+            https://github.com/sissbruecker/linkding.git source
+      - name: Apply patch
+        run: |
+          git -C source apply --check ../patches/usage-tracking.patch
+          git -C source apply ../patches/usage-tracking.patch
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ARM64 image archive
+        uses: docker/build-push-action@v6
+        with:
+          context: source
+          file: source/docker/default.Dockerfile
+          target: linkding
+          platforms: linux/arm64
+          outputs: type=docker,dest=/tmp/linkding-usage.tar
+          tags: dafal/linkding:${{ steps.version.outputs.upstream }}-usage-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linkding-usage-arm64
+          path: /tmp/linkding-usage.tar
+          compression-level: 0
+          retention-days: 1
