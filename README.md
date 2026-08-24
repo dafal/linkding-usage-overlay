@@ -34,6 +34,9 @@ Copy `compose.example.yaml`, configure the data directory and environment file,
 then start the service with Docker Compose. Always back up the SQLite database
 before moving an existing installation to a new upstream or patch version.
 
+See [Deployment](docs/deployment.md) for the backup, upgrade verification, and
+rollback procedure.
+
 ## Updating
 
 1. Change `UPSTREAM_VERSION` to a new Linkding release tag.
